@@ -1,0 +1,16 @@
+[project]
+name = "airflow-flight-price-analysis"
+version = "1.0.0"
+description = "Airflow pipeline: Bangladesh flight price ingestion, validation, transformation, KPI computation, and analytics loading."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.black]
+line-length = 100
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

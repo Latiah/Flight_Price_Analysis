@@ -1,0 +1,224 @@
+# Full local stack for the flight price pipeline. Nothing in this project is
+# installed on the host: Airflow, MySQL, and PostgreSQL all run as containers.
+#
+#   docker compose up -d          bring the stack up
+#   docker compose logs -f        follow all logs
+#   docker compose down           stop (keeps data volumes)
+#   docker compose down -v        stop and wipe the databases
+#
+# Three databases, deliberately separate:
+#   airflow-meta-db  Airflow's own metadata (task state, DAG runs)
+#   mysql            staging  — raw ingested CSV rows
+#   postgres         analytics — enriched fact table + KPI tables
+# Keeping Airflow's metadata off the analytics server means `down -v` or a
+# schema change on one never disturbs the other.
+
+x-airflow-common: &airflow-common
+  build: .
+  image: flight-price-airflow:2.10.5
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-meta-db:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+    # src/ lives at the AIRFLOW_HOME root, so `from src.config import settings`
+    # resolves identically in the scheduler, the webserver, and `tasks test`.
+    PYTHONPATH: /opt/airflow
+
+    # The DAG imports seven modules from the bind-mounted src/ tree. Reading them
+    # through a Docker Desktop bind mount is slow enough on macOS and Windows to
+    # blow the 30s default on a cold parse (no __pycache__ yet), which surfaces
+    # confusingly as "DagBag import timeout" rather than as slow I/O. The DAG
+    # itself does no work at import time; only the file reads are slow.
+    AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT: "120"
+    AIRFLOW__CORE__DAG_FILE_PROCESSOR_TIMEOUT: "180"
+
+    # Re-parse the DAG folder every 5 minutes instead of every 30 seconds. With a
+    # parse costing 20-50s over the bind mount, the default interval leaves the
+    # scheduler parsing essentially non-stop, which starves the running tasks of
+    # CPU. There is one DAG here and it is triggered manually, so picking up an
+    # edit within five minutes is ample.
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "300"
+    # One DAG file, so a second parsing process only adds contention.
+    AIRFLOW__SCHEDULER__PARSING_PROCESSES: "1"
+
+    # Two gunicorn workers instead of the default four. Each worker loads the
+    # full DAG bag, so on a typical Docker Desktop allocation (~4 GB across all
+    # six containers) four workers contend for memory and I/O badly enough that
+    # the webserver misses gunicorn's startup deadline and is killed in a loop.
+    # This is a single-user local stack; two workers is ample.
+    AIRFLOW__WEBSERVER__WORKERS: "2"
+    # The default 120s deadline assumes local-disk imports. DAGs and src/ come
+    # over a bind mount, which is markedly slower on macOS and Windows, so give
+    # the boot room rather than let a slow first import look like a crash.
+    AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT: "300"
+    AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT: "300"
+
+    # Airflow Connections injected as environment variables rather than seeded
+    # into the metadata DB. Two consequences worth the trade: the stack has no
+    # imperative "create the connections" bootstrap step, and credentials never
+    # persist in a volume. `mysql_staging` / `postgres_analytics` are the
+    # connection IDs the DAG asks for.
+    AIRFLOW_CONN_MYSQL_STAGING: '{"conn_type": "mysql", "host": "mysql", "port": 3306, "schema": "${MYSQL_DATABASE}", "login": "${MYSQL_USER}", "password": "${MYSQL_PASSWORD}"}'
+    AIRFLOW_CONN_POSTGRES_ANALYTICS: '{"conn_type": "postgres", "host": "postgres", "port": 5432, "schema": "${POSTGRES_DATABASE}", "login": "${POSTGRES_USER}", "password": "${POSTGRES_PASSWORD}"}'
+
+    # Container-absolute so a task's resolved path never depends on its cwd.
+    RAW_CSV_PATH: ${RAW_CSV_PATH}
+    PROCESSED_DATA_DIR: ${PROCESSED_DATA_DIR}
+  volumes:
+    # Bind-mounted, not baked into the image: editing a DAG or a src/ module on
+    # the host takes effect without a rebuild. Only requirements.txt changes
+    # need `docker compose build`.
+    - ./dags:/opt/airflow/dags
+    - ./src:/opt/airflow/src
+    - ./sql:/opt/airflow/sql
+    - ./data:/opt/airflow/data
+    - ./logs:/opt/airflow/logs
+    # Mounted so the unit tests can be run inside the container, against the same
+    # pinned dependency set the DAG uses. pyproject.toml carries the pytest config.
+    - ./tests:/opt/airflow/tests
+    - ./pyproject.toml:/opt/airflow/pyproject.toml:ro
+  # Group 0 so the bind-mounted logs/ directory stays writable whatever the
+  # host UID is. Set AIRFLOW_UID=$(id -u) in .env on Linux; the default suits
+  # Docker Desktop on macOS and Windows.
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    airflow-meta-db:
+      condition: service_healthy
+
+services:
+  airflow-meta-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-meta-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    ports:
+      # Exposed only so you can point a SQL client at the staging data.
+      # Airflow reaches MySQL over the compose network, not through this port.
+      - "${MYSQL_PORT:-3307}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # Files in /docker-entrypoint-initdb.d run once, in filename order, on
+      # first startup of an empty data directory — so the staging schema is
+      # created by the container itself and there is no setup script to forget.
+      # Mounted file by file: validation_queries.sql lives in the same source
+      # directory but is a query library, not DDL, and must not run at init.
+      - ./sql/mysql/create_database.sql:/docker-entrypoint-initdb.d/01_create_database.sql:ro
+      - ./sql/mysql/create_staging_table.sql:/docker-entrypoint-initdb.d/02_create_staging_table.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      # MySQL's first boot initialises the data directory before it accepts
+      # connections; without this the retries expire during a cold start.
+      start_period: 40s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DATABASE}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # POSTGRES_DB already creates the analytics database, so only the table
+      # DDL is needed here — that is why there is no create_database.sql on the
+      # PostgreSQL side.
+      - ./sql/postgres/create_tables.sql:/docker-entrypoint-initdb.d/01_create_tables.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DATABASE}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # Runs to completion, then the long-lived Airflow services start. Splitting
+  # migration out of the scheduler/webserver keeps two processes from racing to
+  # migrate the same metadata DB on a cold start.
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow users create \
+          --username "${AIRFLOW_ADMIN_USER}" \
+          --password "${AIRFLOW_ADMIN_PASSWORD}" \
+          --firstname Admin --lastname User \
+          --role Admin --email admin@example.com \
+          || echo "admin user already exists, continuing"
+    restart: "no"
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      # Asks Airflow whether this host's scheduler job is actually alive, rather
+      # than trusting that the process is still running — a wedged scheduler
+      # keeps its PID.
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      airflow-meta-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      # The DAG's tasks talk to both databases, so the scheduler waits for them
+      # to be genuinely ready rather than merely started.
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "${AIRFLOW_WEB_PORT:-8080}:8080"
+    depends_on:
+      airflow-meta-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      # Longer than the master timeout above, so a slow cold start is reported
+      # as "starting" rather than "unhealthy".
+      start_period: 320s
+    restart: unless-stopped
+
+volumes:
+  airflow-meta-db-data:
+  mysql-data:
+  postgres-data:
