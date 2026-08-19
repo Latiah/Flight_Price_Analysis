@@ -20,6 +20,11 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-meta-db:5432/airflow
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # The DAG arrives unpaused, so `airflow dags trigger` works on a fresh stack
+    # instead of queueing a run that never starts. Safe here because the DAG has
+    # schedule=None and catchup=False: unpausing it cannot cause a run on its own,
+    # it only lets a manual trigger proceed.
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
     AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
     AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
     # src/ lives at the AIRFLOW_HOME root, so `from src.config import settings`

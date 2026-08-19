@@ -17,7 +17,13 @@ dist/
 # Airflow
 airflow.cfg
 airflow.db
-logs/
+# Contents, not the directory itself: git will not descend into an excluded
+# directory, so a `!logs/.gitkeep` negation under `logs/` would never match --
+# and the directory has to stay tracked, because docker-compose bind-mounts it
+# and Docker would otherwise create it root-owned, leaving the scheduler unable
+# to write task logs.
+logs/*
+!logs/.gitkeep
 standalone_admin_password.txt
 
 # Pipeline intermediate artifacts (regenerated on each run)

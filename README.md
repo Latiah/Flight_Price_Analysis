@@ -60,8 +60,11 @@ Place the dataset at `data/raw/Flight_Price_Dataset_of_Bangladesh.csv`, then:
 
 ```bash
 docker compose up -d
-docker compose ps          # wait for all services to read "healthy"
+docker compose ps          # wait for the five long-running services to read "healthy"
 ```
+
+`airflow-init` is expected to show `Exited (0)` — it is the one-shot migration
+step, not a service that stays up.
 
 The first run builds the Airflow image and pulls three database images, so expect
 a few minutes; later starts take seconds. The webserver is the slowest to become
@@ -108,6 +111,10 @@ the Compose network the databases are reached by service name, `mysql` and
 `postgres`.
 
 ## 4. Running the Pipeline
+
+The DAG arrives **unpaused** (`dags_are_paused_at_creation` is off in Compose), so
+it is ready to trigger as soon as the scheduler is healthy. It still never runs on
+its own: `schedule=None` means every run is one you asked for.
 
 Trigger from the UI, or from the command line:
 
@@ -179,6 +186,7 @@ Since those modules import no Airflow, the same suite runs on the host too:
 | Port 8080 / 3307 / 5433 in use | Change `AIRFLOW_WEB_PORT`, `MYSQL_PORT`, or `POSTGRES_PORT` in `.env`, then `docker compose up -d` |
 | Connection refused to `mysql` or `postgres` | Inside containers the hosts are the service names; `localhost:3307` / `localhost:5433` work only from the host |
 | `validate_staging_data` fails the DAG | Valid-row ratio under 95%. Read `data/processed/data_quality_report.json` — failing here is deliberate, not a bug |
+| Tasks stuck in `up_for_retry`, scheduler logged `DAG ... is missing and will be deactivated` | A transient bind-mount read failure made the DAG file look absent, so Airflow dropped the serialized DAG and had nothing left to schedule the retries against. Almost always memory or I/O contention — give Docker more resources, then `docker compose restart airflow-scheduler` and retrigger |
 | `DagBag import timeout` | Slow bind-mount reads on macOS/Windows. Compose already raises `dagbag_import_timeout` and the scheduler's parse interval |
 | Permission errors on `logs/` (Linux) | Set `AIRFLOW_UID=$(id -u)` in `.env`, then `docker compose up -d` |
 
