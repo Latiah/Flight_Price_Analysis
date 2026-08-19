@@ -9,7 +9,7 @@ PostgreSQL. Everything runs in Docker.
 | Source | `Flight_Price_Dataset_of_Bangladesh.csv` — 57,000 rows, 17 columns |
 | Staging | MySQL 8 — `stg_flight_prices` |
 | Analytics | PostgreSQL 16 — one fact table + four KPI tables |
-| Orchestration | Airflow 2.10.5, LocalExecutor, 9 tasks |
+| Orchestration | Airflow 3.3.1, LocalExecutor, 9 tasks |
 | Runtime | Docker Compose, 6 services, nothing installed on the host |
 | Data quality | 57,000 / 57,000 rows valid |
 | Tests | 21 unit tests over the pure logic in `src/` |
@@ -26,8 +26,9 @@ Six containers, reproducible from `docker compose up -d`:
 | `mysql` | Staging — raw ingested rows |
 | `postgres` | Analytics — fact table + KPI tables |
 | `airflow-init` | One-shot `db migrate` + admin user, then exits |
-| `airflow-scheduler` | Executes the DAG |
-| `airflow-webserver` | UI on port 8080 |
+| `airflow-apiserver` | UI, REST API, and the Task Execution API, on port 8080 |
+| `airflow-scheduler` | Schedules the DAG and, under LocalExecutor, runs its tasks |
+| `airflow-dag-processor` | Parses `dags/` into the serialised DAGs the scheduler reads |
 
 Four design decisions:
 
@@ -215,11 +216,6 @@ would silently corrupt those rows.
 looked like corruption. Profiling the *ratio* rather than the difference showed a
 constant 1.20 factor, which reframed it as a pricing rule. Handled as in §6.
 
-**Airflow and SQLAlchemy could not both be satisfied.** The image build failed with
-`ResolutionImpossible`: `requirements.txt` asked for `SQLAlchemy>=2.0.0` while Airflow
-2.10.5 pins `1.4.54`. Airflow 2.x does not support SQLAlchemy 2.0, so the requirement
-was wrong — unpinned it and let Airflow's own dependency govern.
-
 **The scheduler was starving the pipeline.** Ingestion crawled while MySQL sat idle,
 so the bottleneck was not the database. The scheduler log showed the DAG being
 re-parsed every ~40 seconds, with successive parses taking 21.3, 32.8, 46.1 and 57.8
@@ -227,17 +223,20 @@ seconds over the Windows bind mount — it was parsing almost without pause. Rai
 `min_file_process_interval` to 300 s and
 `parsing_processes` to 1 cut the full run from **310 seconds to 81**.
 
-**The webserver would not start.** Repeated `No response from gunicorn master within
-120 seconds`. Not a crash: the default four gunicorn workers each load the full DAG
-bag, and together they could not finish booting inside gunicorn's startup deadline.
-Reduced to two workers and raised the timeouts.
-
 **DAG import timeouts.** `DagBag import timeout after 30.0s`, spent purely reading
 bind-mounted module files on a cold parse. Raised `dagbag_import_timeout` to 120 s.
 
 **Writing 57,000 validation results back.** Row-by-row `UPDATE` takes minutes. Replaced
 with a bulk insert into a temporary table plus one joined `UPDATE`, which completes in
 seconds.
+
+**A clean row's `validation_errors` stopped being SQL NULL.** The column exists so
+that `validation_errors IS NULL` is a meaningful query against staging. Because the
+error strings are a string-dtype column, `Series.where(cond, other=None)` fills the
+masked entries with float `NaN`, and neither `NaN` nor `pd.NA` is a value the MySQL
+driver can adapt to `NULL`. Built the column explicitly as an object column of real
+`None` rather than relying on `where`'s fill value. The unit tests caught this;
+nothing else did.
 
 **Schema drift.** After adding `has_fare_uplift` to the DDL, the load failed with
 `column ... does not exist` — the init scripts only run on an empty data directory, so

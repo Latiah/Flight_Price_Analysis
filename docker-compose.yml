@@ -12,10 +12,19 @@
 #   postgres         analytics — enriched fact table + KPI tables
 # Keeping Airflow's metadata off the analytics server means `down -v` or a
 # schema change on one never disturbs the other.
+#
+# Airflow runs as several cooperating processes. Three of them run here:
+#   airflow-apiserver      the UI, the REST API, and the Task Execution API
+#   airflow-scheduler      decides what runs; with LocalExecutor it also runs it
+#   airflow-dag-processor  parses the DAG files
+# DAG parsing happens in the dag-processor rather than the scheduler, which makes
+# it a required service, not an optional extra: without it no DAG is registered.
+# The triggerer is deliberately absent — it only services deferrable operators,
+# and this DAG has none.
 
 x-airflow-common: &airflow-common
   build: .
-  image: flight-price-airflow:2.10.5
+  image: flight-price-airflow:3.3.1
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-meta-db:5432/airflow
@@ -25,10 +34,30 @@ x-airflow-common: &airflow-common
     # schedule=None and catchup=False: unpausing it cannot cause a run on its own,
     # it only lets a manual trigger proceed.
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+
+    # The Flask-AppBuilder UI login ships as a provider rather than in core.
+    # Naming it here is what keeps the username/password admin account working;
+    # left unset, Airflow uses the simple auth manager and ignores the admin
+    # credentials in .env. requirements.txt installs the matching provider.
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+
+    # Task code reaches Airflow through the Task Execution API served by the
+    # api-server, never the metadata database directly. Even under LocalExecutor,
+    # where tasks run as scheduler subprocesses, they need this URL to fetch
+    # connections and report state — which is why the scheduler waits for the
+    # api-server to be healthy before it starts.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+
     AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
-    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+    # Signs the api-server's session cookies.
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+    # Signs the JWTs that task processes use to authenticate to the Execution API.
+    # Required: every component that mints or validates a token has to agree on
+    # it, which is why it sits in the shared env block.
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+
     # src/ lives at the AIRFLOW_HOME root, so `from src.config import settings`
-    # resolves identically in the scheduler, the webserver, and `tasks test`.
+    # resolves identically in the scheduler, the api-server, and `tasks test`.
     PYTHONPATH: /opt/airflow
 
     # The DAG imports seven modules from the bind-mounted src/ tree. Reading them
@@ -37,28 +66,26 @@ x-airflow-common: &airflow-common
     # confusingly as "DagBag import timeout" rather than as slow I/O. The DAG
     # itself does no work at import time; only the file reads are slow.
     AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT: "120"
-    AIRFLOW__CORE__DAG_FILE_PROCESSOR_TIMEOUT: "180"
-
+    # These three tune the dag-processor. Parsing is its own component, so its
+    # knobs live in the [dag_processor] section rather than under [scheduler].
+    AIRFLOW__DAG_PROCESSOR__DAG_FILE_PROCESSOR_TIMEOUT: "180"
     # Re-parse the DAG folder every 5 minutes instead of every 30 seconds. With a
     # parse costing 20-50s over the bind mount, the default interval leaves the
-    # scheduler parsing essentially non-stop, which starves the running tasks of
+    # processor parsing essentially non-stop, which starves the running tasks of
     # CPU. There is one DAG here and it is triggered manually, so picking up an
     # edit within five minutes is ample.
-    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "300"
+    AIRFLOW__DAG_PROCESSOR__MIN_FILE_PROCESS_INTERVAL: "300"
     # One DAG file, so a second parsing process only adds contention.
-    AIRFLOW__SCHEDULER__PARSING_PROCESSES: "1"
+    AIRFLOW__DAG_PROCESSOR__PARSING_PROCESSES: "1"
 
-    # Two gunicorn workers instead of the default four. Each worker loads the
-    # full DAG bag, so on a typical Docker Desktop allocation (~4 GB across all
-    # six containers) four workers contend for memory and I/O badly enough that
-    # the webserver misses gunicorn's startup deadline and is killed in a loop.
-    # This is a single-user local stack; two workers is ample.
-    AIRFLOW__WEBSERVER__WORKERS: "2"
-    # The default 120s deadline assumes local-disk imports. DAGs and src/ come
-    # over a bind mount, which is markedly slower on macOS and Windows, so give
-    # the boot room rather than let a slow first import look like a crash.
-    AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT: "300"
-    AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT: "300"
+    # Two api-server workers instead of the default. On a typical Docker Desktop
+    # allocation (~4 GB across all six containers) more workers contend for memory
+    # and I/O without making a single-user local UI any faster.
+    AIRFLOW__API__WORKERS: "2"
+    # The default 120s assumes local-disk imports. DAGs and src/ come over a bind
+    # mount, markedly slower on macOS and Windows, so give the boot room rather
+    # than let a slow first import look like a crash.
+    AIRFLOW__API__WORKER_TIMEOUT: "300"
 
     # Airflow Connections injected as environment variables rather than seeded
     # into the metadata DB. Two consequences worth the trade: the stack has no
@@ -160,23 +187,47 @@ services:
     restart: unless-stopped
 
   # Runs to completion, then the long-lived Airflow services start. Splitting
-  # migration out of the scheduler/webserver keeps two processes from racing to
+  # migration out of the other services keeps three processes from racing to
   # migrate the same metadata DB on a cold start.
+  #
+  # The migration and the admin account are driven by the image's own entrypoint
+  # via the _AIRFLOW_* variables below, rather than by an explicit `airflow users
+  # create`: that subcommand moved into the FAB provider in Airflow 3, and letting
+  # the entrypoint do it keeps this file off whichever spelling is current.
   airflow-init:
     <<: *airflow-common
-    entrypoint: /bin/bash
-    command:
-      - -c
-      - |
-        set -e
-        airflow db migrate
-        airflow users create \
-          --username "${AIRFLOW_ADMIN_USER}" \
-          --password "${AIRFLOW_ADMIN_PASSWORD}" \
-          --firstname Admin --lastname User \
-          --role Admin --email admin@example.com \
-          || echo "admin user already exists, continuing"
+    command: version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
     restart: "no"
+
+  # The UI, the REST API, and the Task Execution API that task processes call
+  # home to. First of the Airflow services to start, because the other two are
+  # useless without it.
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "${AIRFLOW_WEB_PORT:-8080}:8080"
+    depends_on:
+      airflow-meta-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      # The health endpoint lives under /api/v2.
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      # Longer than the worker timeout above, so a slow cold start is reported
+      # as "starting" rather than "unhealthy".
+      start_period: 320s
+    restart: unless-stopped
 
   airflow-scheduler:
     <<: *airflow-common
@@ -195,6 +246,10 @@ services:
         condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
+      # Under LocalExecutor the scheduler is what runs the tasks, and an Airflow 3
+      # task cannot start without the Execution API behind this service.
+      airflow-apiserver:
+        condition: service_healthy
       # The DAG's tasks talk to both databases, so the scheduler waits for them
       # to be genuinely ready rather than merely started.
       mysql:
@@ -203,24 +258,23 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  airflow-webserver:
+  # Parses dags/ and writes the serialised DAGs the scheduler reads. Its own
+  # service in Airflow 3 — if it is not running, the DAG never appears at all.
+  airflow-dag-processor:
     <<: *airflow-common
-    command: webserver
-    ports:
-      - "${AIRFLOW_WEB_PORT:-8080}:8080"
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      # Generous, because the first parse of this DAG over a bind mount is slow.
+      start_period: 180s
     depends_on:
       airflow-meta-db:
         condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      # Longer than the master timeout above, so a slow cold start is reported
-      # as "starting" rather than "unhealthy".
-      start_period: 320s
     restart: unless-stopped
 
 volumes:

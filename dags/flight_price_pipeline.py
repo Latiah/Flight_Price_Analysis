@@ -37,7 +37,11 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import pendulum
-from airflow.decorators import dag, task
+# airflow.sdk is the Task SDK, Airflow's stable public interface for DAG authoring.
+# It deliberately exposes no Airflow internals, which is what lets this DAG be
+# parsed by the dag-processor and executed by the scheduler without either
+# sharing a process with it.
+from airflow.sdk import dag, task
 
 from src.config import settings
 from src.database import mysql, postgres

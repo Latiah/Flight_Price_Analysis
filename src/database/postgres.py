@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 
 import pandas as pd
-from airflow.hooks.base import BaseHook
+from airflow.sdk import BaseHook
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, URL
 

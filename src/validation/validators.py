@@ -178,7 +178,16 @@ def validate_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
             "is_valid": is_valid,
             # NULL rather than "" for a clean row, so `validation_errors IS NULL`
             # is a meaningful query against staging.
-            "validation_errors": error_strings.where(~is_valid, other=None),
+            #
+            # Built as an object column holding real ``None`` rather than via
+            # ``where(..., other=None)``: on a string-dtype column that yields
+            # float NaN, and neither NaN nor pd.NA is something the MySQL driver
+            # can adapt to SQL NULL. ``None`` is.
+            "validation_errors": pd.Series(
+                [None if ok else text for ok, text in zip(is_valid, error_strings)],
+                index=df.index,
+                dtype=object,
+            ),
             "reconciles_exactly": consistency["reconciles_exactly"],
             "has_known_uplift": consistency["has_known_uplift"],
         },

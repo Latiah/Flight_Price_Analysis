@@ -13,8 +13,8 @@ CSV (57,000 rows)
   -> PostgreSQL analytics   fact table, then four KPI tables
 ```
 
-Stack: Docker Compose, Airflow 2.10 (LocalExecutor), MySQL 8, PostgreSQL 16,
-Python 3.11 with pandas and SQLAlchemy. Nothing is installed on the host.
+Stack: Docker Compose, Airflow 3.3 (LocalExecutor), MySQL 8, PostgreSQL 16,
+Python 3.12 with pandas and SQLAlchemy. Nothing is installed on the host.
 
 ## 1. Repository Layout
 
@@ -59,6 +59,7 @@ cp .env.example .env      # then set the passwords and generate the two Airflow 
 Place the dataset at `data/raw/Flight_Price_Dataset_of_Bangladesh.csv`, then:
 
 ```bash
+docker compose build 
 docker compose up -d
 docker compose ps          # wait for the five long-running services to read "healthy"
 ```
@@ -67,8 +68,9 @@ docker compose ps          # wait for the five long-running services to read "he
 step, not a service that stays up.
 
 The first run builds the Airflow image and pulls three database images, so expect
-a few minutes; later starts take seconds. The webserver is the slowest to become
-healthy — typically a minute or two, reporting `starting` until then.
+a few minutes; later starts take seconds. The api-server is the slowest to become
+healthy — typically a minute or two, reporting `starting` until then, and the
+scheduler deliberately waits for it before starting.
 
 Open **http://localhost:8080** and log in with `AIRFLOW_ADMIN_USER` /
 `AIRFLOW_ADMIN_PASSWORD` (`admin` / `admin` by default).
@@ -87,34 +89,15 @@ docker compose build       # rebuild after editing requirements.txt
 | `mysql` | `mysql:8.0` | Staging — raw ingested CSV rows |
 | `postgres` | `postgres:16-alpine` | Analytics — fact table + KPI tables |
 | `airflow-init` | built locally | One-shot `db migrate` + admin user |
-| `airflow-scheduler` | built locally | Executes the DAG |
-| `airflow-webserver` | built locally | UI on port 8080 |
+| `airflow-apiserver` | built locally | UI, REST API, and Task Execution API on port 8080 |
+| `airflow-scheduler` | built locally | Schedules and, under LocalExecutor, executes the tasks |
+| `airflow-dag-processor` | built locally | Parses `dags/` into serialised DAGs |
 
-Four things worth knowing:
+Pipeline
 
-- **Airflow's metadata DB is a separate service from the analytics DB.** Both are
-  PostgreSQL, but mixing them would mean a schema change or a volume wipe on one
-  disturbs the other.
-- **Schemas create themselves.** The DDL in `sql/` is mounted into each database
-  container's `/docker-entrypoint-initdb.d`, which the official images run once on
-  first startup — so there is no setup script to run and forget. The corollary:
-  after editing anything in `sql/`, only `docker compose down -v` picks it up.
-- **The two Airflow Connections need no setup.** `mysql_staging` and
-  `postgres_analytics` are injected as `AIRFLOW_CONN_*` environment variables from
-  your `.env`, so there is no bootstrap step and no credentials inside a volume.
-- **`dags/`, `src/`, `sql/`, and `data/` are bind-mounted**, so editing a module
-  takes effect without a rebuild. Only `requirements.txt` changes need one.
-
-Host ports default to **8080** (UI), **3307** (MySQL), and **5433** (PostgreSQL) —
-off the standard database ports so they don't collide with a local install. Inside
-the Compose network the databases are reached by service name, `mysql` and
-`postgres`.
+![Airflow pipeline](diagrams/flight_price_pipeline-graph.png)
 
 ## 4. Running the Pipeline
-
-The DAG arrives **unpaused** (`dags_are_paused_at_creation` is off in Compose), so
-it is ready to trigger as soon as the scheduler is healthy. It still never runs on
-its own: `schedule=None` means every run is one you asked for.
 
 Trigger from the UI, or from the command line:
 
@@ -139,6 +122,8 @@ logs the outcome.
 | four `compute_kpi_*` tasks | One per KPI, in parallel, each replacing its own table |
 | `pipeline_summary` | Re-reads every row count from the database as an independent check |
 
+
+
 ## 6. Inspecting the Results
 
 Open a shell against either database without installing a client:
@@ -148,8 +133,6 @@ docker compose exec mysql mysql -u flight_user_msql -p flight_staging
 docker compose exec postgres psql -U flight_user_pgsql -d flight_analytics
 ```
 
-Or point a GUI client at `localhost:3307` / `localhost:5433` with the credentials
-from `.env`.
 
 Ready-made queries, rather than repeating them here:
 
@@ -160,21 +143,13 @@ Ready-made queries, rather than repeating them here:
   fare spreads, and load sanity checks.
 
 ## 7. Testing
-
+Run 
 ```bash
 docker compose exec airflow-scheduler pytest tests/ -v
 ```
 
 21 tests over the pure logic in `src/validation`, `src/transformation`, and
-`src/kpi`, using small in-memory DataFrames whose correct answer is obvious by
-hand. Kept deliberately few and readable — one plain function per behaviour, no
-test classes or parametrisation — so the suite doubles as a description of what the
-pipeline guarantees. The two that protect the fare data are worth reading first:
-`test_the_20_percent_uplift_rows_are_valid` and
-`test_an_existing_total_is_never_overwritten`.
-
-Since those modules import no Airflow, the same suite runs on the host too:
-`python -m pytest tests/ -v`.
+`src/kpi`, 
 
 ## 8. Troubleshooting
 
@@ -182,7 +157,10 @@ Since those modules import no Airflow, the same suite runs on the host too:
 |---|---|
 | `check_source_file` fails | CSV not at `data/raw/…`. Place it there — no restart needed, `data/` is bind-mounted |
 | A table is missing | Init DDL runs only on a database's *first* startup, so a later edit to `sql/` was never applied: `docker compose down -v && docker compose up -d` |
-| `airflow-webserver` sits at `starting`, then restarts | Gunicorn missed its startup deadline — each worker loads the full DAG bag. Compose already lowers the worker count and raises the timeout; if it persists, give Docker more resources or set `AIRFLOW__WEBSERVER__WORKERS: "1"` |
+| `airflow-apiserver` sits at `starting`, then restarts | It missed its startup deadline — each worker loads the full DAG bag. Compose already lowers the worker count and raises the timeout; if it persists, give Docker more resources or set `AIRFLOW__API__WORKERS: "1"` |
+| The DAG never appears in the UI, and `airflow dags list` is empty | `airflow-dag-processor` is not running. Airflow 3 parses DAGs in that separate service, so the scheduler alone will never register one: `docker compose up -d airflow-dag-processor` |
+| `Internal Server Error` in the browser right after upgrading from Airflow 2, while `curl http://localhost:8080/` still returns 200 | Stale server-side session rows. The Airflow 2 sessions in the metadata `session` table cannot be deserialised by Airflow 3's FAB provider (`msgspec.DecodeError: MessagePack data is malformed`), and because `AIRFLOW_SECRET_KEY` is unchanged the old browser cookie still validates and points straight at one. The React shell at `/` loads regardless, so only the login route fails. Clear them — it logs everyone out and touches no pipeline data: `docker compose exec airflow-meta-db psql -U airflow -d airflow -c "DELETE FROM session;"`, then hard-refresh the browser |
+| After upgrading from the Airflow 2 stack, port 8080 is taken and `docker compose down` did not free it | The old `airflow-webserver` container is an orphan — that service no longer exists in this compose file, so Compose stopped tracking it. `docker compose down --remove-orphans` |
 | Port 8080 / 3307 / 5433 in use | Change `AIRFLOW_WEB_PORT`, `MYSQL_PORT`, or `POSTGRES_PORT` in `.env`, then `docker compose up -d` |
 | Connection refused to `mysql` or `postgres` | Inside containers the hosts are the service names; `localhost:3307` / `localhost:5433` work only from the host |
 | `validate_staging_data` fails the DAG | Valid-row ratio under 95%. Read `data/processed/data_quality_report.json` — failing here is deliberate, not a bug |
@@ -190,13 +168,3 @@ Since those modules import no Airflow, the same suite runs on the host too:
 | `DagBag import timeout` | Slow bind-mount reads on macOS/Windows. Compose already raises `dagbag_import_timeout` and the scheduler's parse interval |
 | Permission errors on `logs/` (Linux) | Set `AIRFLOW_UID=$(id -u)` in `.env`, then `docker compose up -d` |
 
-## 9. Limitations
-
-- A **batch** workflow over a static CSV — full truncate and reload, not
-  incremental or streaming.
-- Seasonal classification relies on the source `Seasonality` column
-  (`Regular` / `Winter Holidays` / `Eid` / `Hajj`). If a future version of the
-  dataset drops it, the seasonal KPI would need a new, explicitly documented proxy;
-  this project does not invent one because the current data does not need it.
-- The source has no booking identifier, so **one row is one booking** (one fare
-  quote) and every count KPI is a row count.

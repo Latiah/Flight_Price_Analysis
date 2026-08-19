@@ -1,17 +1,23 @@
 # Installed into the Airflow image by the Dockerfile, resolved against the
-# official Airflow 2.10.5 / Python 3.11 constraints file. Airflow itself is not
-# listed here — it comes from the `apache/airflow:2.10.5-python3.11` base image,
+# official Airflow 3.3.1 / Python 3.12 constraints file. Airflow itself is not
+# listed here — it comes from the `apache/airflow:3.3.1-python3.12` base image,
 # so the version is pinned in exactly one place.
 
 # Airflow providers (MySQL staging + PostgreSQL analytics hooks)
-apache-airflow-providers-mysql>=5.5.0
-apache-airflow-providers-postgres>=5.10.0
+apache-airflow-providers-mysql>=6.6.0
+apache-airflow-providers-postgres>=7.0.0
+# Flask-AppBuilder auth manager. In Airflow 3 the FAB-based UI login moved out of
+# core into this provider, so it has to be installed explicitly for the
+# username/password admin account to work — see AIRFLOW__CORE__AUTH_MANAGER in
+# docker-compose.yml. Without it the API server falls back to the simple auth
+# manager and the admin credentials in .env are ignored.
+apache-airflow-providers-fab>=3.8.0
 
 # Data processing
 pandas>=2.1.0
-# SQLAlchemy is deliberately unpinned: Airflow 2.10 requires SQLAlchemy 1.4.x and
-# the constraints file pins 1.4.54, so asking for >=2.0 here can never resolve.
-# The version Airflow itself depends on is the one to use.
+# SQLAlchemy is deliberately unpinned: Airflow pins it via the constraints file
+# (2.0.51 for Airflow 3.3.1), and asking for a different range here could only
+# conflict with it. The version Airflow itself depends on is the one to use.
 SQLAlchemy
 PyMySQL>=1.1.0
 psycopg2-binary>=2.9.9
