@@ -1,0 +1,35 @@
+# Environment / secrets
+.env
+
+# Python
+.venv/
+airflow_env/
+airflow_home/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Airflow
+airflow.cfg
+airflow.db
+logs/
+standalone_admin_password.txt
+
+# Pipeline intermediate artifacts (regenerated on each run)
+data/processed/*
+!data/processed/.gitkeep
+
+# Logs
+*.log
+
+# Editors
+.idea/
+.vscode/
+.DS_Store
+
+data/raw/*
